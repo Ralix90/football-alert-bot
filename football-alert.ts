@@ -120,7 +120,14 @@ function sendTelegram(message: string): Promise<void> {
 
 function getStatValue(stats: Stat[], statType: string): number {
   const stat = stats.find((s) => s.type === statType);
-  return stat?.value ?? 0;
+  const value = stat?.value;
+
+  if (typeof value === "string") {
+    const parsed = parseInt(value.replace("%", ""), 10);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+
+  return value ?? 0;
 }
 
 function buildPressureScore(params: {
@@ -144,39 +151,42 @@ function buildPressureScore(params: {
 
   let score = 0;
 
-  score += totalShots * 0.8;
-  score += totalOnTarget * 3.0;
-  score += totalCorners * 1.5;
-  score += dangerousAttacks * 0.16;
+  // base
+  score += totalShots * 0.7;
+  score += totalOnTarget * 3.4;
+  score += totalCorners * 1.4;
+  score += dangerousAttacks * 0.17;
 
+  // domination / contrôle
   const possessionGap = Math.abs(possessionHome - possessionAway);
-  if (possessionGap >= 10) score += 1.5;
+  if (possessionGap >= 10) score += 1.0;
   if (possessionGap >= 18) score += 1.0;
 
-  if (minute >= 20 && minute <= 30) score += 1.5;
-  if (minute > 30) score += 0.8;
+  // fenêtre chaude
+  if (minute >= 20 && minute <= 30) score += 2.0;
+  if (minute > 30 && minute <= 35) score += 1.0;
 
-  // Bonus si plusieurs signaux sont présents ensemble
-  if (totalOnTarget >= 2 && totalCorners >= 3) score += 2;
+  // combos utiles
+  if (totalOnTarget >= 2 && totalCorners >= 3) score += 2.0;
   if (totalOnTarget >= 3 && dangerousAttacks >= 25) score += 2.5;
-  if (totalCorners >= 5 && dangerousAttacks >= 30) score += 2;
+  if (totalCorners >= 5 && dangerousAttacks >= 30) score += 2.0;
+  if (totalShots >= 8 && totalOnTarget >= 3) score += 1.5;
 
   return Number(score.toFixed(1));
 }
 
 function getGoalProbabilityInfo(pressureScore: number): {
-  label: string;
   title: string;
 } {
   if (pressureScore >= 20) {
-    return { label: "imminent", title: "🔥 But imminent" };
+    return { title: "🔥 But imminent" };
   }
 
   if (pressureScore >= 12) {
-    return { label: "possible", title: "🌡️ But possible" };
+    return { title: "🌡️ But possible" };
   }
 
-  return { label: "faible", title: "🧊 Match froid" };
+  return { title: "🧊 Match froid" };
 }
 
 async function sendForcedTestAlert() {
@@ -241,7 +251,7 @@ async function scan() {
       if (minute === null) continue;
       if (scoreHome !== 0 || scoreAway !== 0) continue;
 
-      // NOTIF 1 : 15 MIN ULTRA COURTE
+      // NOTIF 1 : 15 MIN - on la garde absolument
       if (minute >= 15 && !alertedFixtures15.has(fixtureId)) {
         const message15 = [
           "🕒 15' 0-0",
@@ -252,7 +262,7 @@ async function scan() {
         alertedFixtures15.add(fixtureId);
       }
 
-      // NOTIF 2 : PRESSION / VERSION PRO
+      // NOTIF 2 : VERSION PRO
       if (minute < 15 || minute > 35) continue;
       if (alertedFixturesPressure.has(fixtureId)) continue;
 
@@ -287,15 +297,17 @@ async function scan() {
       const totalCorners = cornersHome + cornersAway;
       const totalDangerousAttacks = dangerousHome + dangerousAway;
 
+      // filtre anti-déchets
       const enoughActivity =
         totalShots >= 4 ||
         totalOnTarget >= 2 ||
         totalCorners >= 3 ||
         totalDangerousAttacks >= 20;
 
-      const notTooWild = totalShots <= 15;
+      const notTooDead = totalShots >= 3;
+      const notTooWild = totalShots <= 16;
 
-      if (!enoughActivity || !notTooWild) continue;
+      if (!enoughActivity || !notTooDead || !notTooWild) continue;
 
       const pressureScore = buildPressureScore({
         minute,
@@ -311,7 +323,8 @@ async function scan() {
         pressureScore >= 12 ||
         totalOnTarget >= 3 ||
         totalCorners >= 5 ||
-        totalDangerousAttacks >= 35;
+        totalDangerousAttacks >= 35 ||
+        (totalOnTarget >= 2 && totalCorners >= 4);
 
       if (!shouldAlert) continue;
 
