@@ -15,7 +15,7 @@ const WATCH_ALL_MATCHES = false;
 
 if (!TELEGRAM_TOKEN || !CHAT_ID || !API_KEY) {
   console.error(
-    "Missing required env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, API_FOOTBALL_KEY",
+    "Missing required env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, API_FOOTBALL_KEY"
   );
   process.exit(1);
 }
@@ -45,10 +45,7 @@ type Stat = {
   value: number | null;
 };
 
-function fetchJson(
-  url: string,
-  headers: Record<string, string>,
-): Promise<unknown> {
+function fetchJson(url: string, headers: Record<string, string>): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith("https") ? https : http;
 
@@ -104,12 +101,10 @@ function sendTelegram(message: string): Promise<void> {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
             resolve();
           } else {
-            reject(
-              new Error(`Telegram error ${res.statusCode}: ${responseBody}`),
-            );
+            reject(new Error(`Telegram error ${res.statusCode}: ${responseBody}`));
           }
         });
-      },
+      }
     );
 
     req.on("error", reject);
@@ -149,38 +144,39 @@ function buildPressureScore(params: {
 
   let score = 0;
 
-  // base
-  score += totalShots * 0.9;
-  score += totalOnTarget * 2.8;
-  score += totalCorners * 1.4;
-  score += dangerousAttacks * 0.14;
+  score += totalShots * 0.8;
+  score += totalOnTarget * 3.0;
+  score += totalCorners * 1.5;
+  score += dangerousAttacks * 0.16;
 
-  // bonus si une équipe domine un peu le ballon
   const possessionGap = Math.abs(possessionHome - possessionAway);
   if (possessionGap >= 10) score += 1.5;
   if (possessionGap >= 18) score += 1.0;
 
-  // bonus si on est déjà bien entré dans la zone 20-30
-  if (minute >= 20 && minute <= 30) score += 1.2;
-  if (minute > 30) score += 0.6;
+  if (minute >= 20 && minute <= 30) score += 1.5;
+  if (minute > 30) score += 0.8;
+
+  // Bonus si plusieurs signaux sont présents ensemble
+  if (totalOnTarget >= 2 && totalCorners >= 3) score += 2;
+  if (totalOnTarget >= 3 && dangerousAttacks >= 25) score += 2.5;
+  if (totalCorners >= 5 && dangerousAttacks >= 30) score += 2;
 
   return Number(score.toFixed(1));
 }
 
 function getGoalProbabilityInfo(pressureScore: number): {
   label: string;
-  emoji: string;
   title: string;
 } {
-  if (pressureScore >= 18) {
-    return { label: "But imminent", emoji: "🔥", title: "🔥 But imminent" };
+  if (pressureScore >= 20) {
+    return { label: "imminent", title: "🔥 But imminent" };
   }
 
-  if (pressureScore >= 11) {
-    return { label: "But possible", emoji: "🌡️", title: "🌡️ But possible" };
+  if (pressureScore >= 12) {
+    return { label: "possible", title: "🌡️ But possible" };
   }
 
-  return { label: "But peu probable", emoji: "🧊", title: "🧊 Match froid" };
+  return { label: "faible", title: "🧊 Match froid" };
 }
 
 async function sendForcedTestAlert() {
@@ -209,13 +205,11 @@ async function scan() {
 
     const liveData = (await fetchJson(
       "https://v3.football.api-sports.io/fixtures?live=all",
-      apiHeaders,
+      apiHeaders
     )) as { response?: Array<Record<string, unknown>> };
 
     const fixtures = liveData.response ?? [];
-    console.log(
-      `[${new Date().toISOString()}] Live fixtures: ${fixtures.length}`,
-    );
+    console.log(`[${new Date().toISOString()}] Live fixtures: ${fixtures.length}`);
 
     for (const match of fixtures) {
       const fixture = match["fixture"] as {
@@ -233,15 +227,12 @@ async function scan() {
         away: number | null;
       };
 
-      const league = match["league"] as { name: string };
-
       const fixtureId = fixture.id;
       const minute = fixture.status.elapsed;
       const home = teams.home.name;
       const away = teams.away.name;
       const scoreHome = goals.home ?? 0;
       const scoreAway = goals.away ?? 0;
-      const leagueName = league.name;
 
       const isFavoriteMatch =
         FAVORITE_TEAMS.has(home) || FAVORITE_TEAMS.has(away);
@@ -252,7 +243,10 @@ async function scan() {
 
       // NOTIF 1 : 15 MIN ULTRA COURTE
       if (minute >= 15 && !alertedFixtures15.has(fixtureId)) {
-        const message15 = ["🕒 15' 0-0", `${home} vs ${away}`].join("\n");
+        const message15 = [
+          "🕒 15' 0-0",
+          `${home} vs ${away}`,
+        ].join("\n");
 
         await sendTelegram(message15);
         alertedFixtures15.add(fixtureId);
@@ -264,7 +258,7 @@ async function scan() {
 
       const statsData = (await fetchJson(
         `https://v3.football.api-sports.io/fixtures/statistics?fixture=${fixtureId}`,
-        apiHeaders,
+        apiHeaders
       )) as {
         response?: Array<{
           statistics: Stat[];
@@ -293,7 +287,6 @@ async function scan() {
       const totalCorners = cornersHome + cornersAway;
       const totalDangerousAttacks = dangerousHome + dangerousAway;
 
-      // garde-fous : on évite les matchs totalement morts
       const enoughActivity =
         totalShots >= 4 ||
         totalOnTarget >= 2 ||
@@ -314,9 +307,8 @@ async function scan() {
         possessionAway,
       });
 
-      // déclenchement pro
       const shouldAlert =
-        pressureScore >= 11 ||
+        pressureScore >= 12 ||
         totalOnTarget >= 3 ||
         totalCorners >= 5 ||
         totalDangerousAttacks >= 35;
