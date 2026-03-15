@@ -5,112 +5,72 @@ const TELEGRAM_TOKEN = process.env["TELEGRAM_TOKEN"];
 const CHAT_ID = process.env["TELEGRAM_CHAT_ID"];
 const API_KEY = process.env["API_FOOTBALL_KEY"];
 
-// false = vrai mode live
-// true = envoie une alerte de test au démarrage
-const TEST_FORCE_ALERT = false;
-
-// false = surveille seulement tes équipes favorites
-// true = surveille tous les matchs
-const WATCH_ALL_MATCHES = false;
-
 if (!TELEGRAM_TOKEN || !CHAT_ID || !API_KEY) {
-  console.error(
-    "Missing required env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, API_FOOTBALL_KEY"
-  );
+  console.error("Missing required env vars");
   process.exit(1);
 }
 
-const FAVORITE_TEAMS = new Set([
+const MAIN_TEAMS = new Set([
   "Barcelona",
   "Real Madrid",
-  "Atletico Madrid",
   "Arsenal",
   "Manchester City",
   "Inter",
   "Napoli",
-  "AC Milan",
   "Bayern Munich",
-  "Borussia Dortmund",
   "Paris Saint Germain",
-  "Lens",
-  "Marseille",
+  "Marseille"
 ]);
 
-const alertedFixtures15 = new Set<number>();
-const alertedFixturesPressure = new Set<number>();
-let testAlertSent = false;
+const SECONDARY_TEAMS = new Set([
+  "Liverpool",
+  "Chelsea",
+  "Manchester United",
+  "Tottenham",
+  "Juventus",
+  "AC Milan",
+  "AS Roma",
+  "Borussia Dortmund",
+  "Benfica",
+  "Porto",
+  "Ajax"
+]);
 
-type Stat = {
-  type: string;
-  value: number | null;
-};
+const alerted15 = new Set<number>();
+const alertedPressure = new Set<number>();
+const alertedOver = new Set<number>();
 
-function fetchJson(url: string, headers: Record<string, string>): Promise<unknown> {
-  return new Promise((resolve, reject) => {
+type Stat = { type: string; value: number | string | null };
+
+function fetchJson(url: string, headers: Record<string,string>): Promise<any> {
+  return new Promise((resolve,reject)=>{
     const lib = url.startsWith("https") ? https : http;
 
-    const req = lib.get(url, { headers }, (res) => {
-      let body = "";
-
-      res.on("data", (chunk: Buffer) => {
-        body += chunk.toString();
-      });
-
-      res.on("end", () => {
-        try {
-          resolve(JSON.parse(body));
-        } catch (e) {
-          reject(new Error(`JSON parse error: ${e}`));
-        }
-      });
+    const req = lib.get(url,{headers},res=>{
+      let body="";
+      res.on("data",(c:Buffer)=>body+=c.toString());
+      res.on("end",()=>resolve(JSON.parse(body)));
     });
 
-    req.on("error", reject);
-
-    req.setTimeout(20000, () => {
-      req.destroy(new Error("Request timed out"));
-    });
+    req.on("error",reject);
   });
 }
 
-function sendTelegram(message: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      chat_id: CHAT_ID,
-      text: message,
-    });
+function sendTelegram(message:string){
+  return new Promise((resolve)=>{
+    const body = JSON.stringify({chat_id:CHAT_ID,text:message});
 
-    const req = https.request(
-      {
-        hostname: "api.telegram.org",
-        path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
-        },
-      },
-      (res) => {
-        let responseBody = "";
-
-        res.on("data", (chunk) => {
-          responseBody += chunk.toString();
-        });
-
-        res.on("end", () => {
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve();
-          } else {
-            reject(new Error(`Telegram error ${res.statusCode}: ${responseBody}`));
-          }
-        });
+    const req = https.request({
+      hostname:"api.telegram.org",
+      path:`/bot${TELEGRAM_TOKEN}/sendMessage`,
+      method:"POST",
+      headers:{
+        "Content-Type":"application/json",
+        "Content-Length":Buffer.byteLength(body)
       }
-    );
-
-    req.on("error", reject);
-
-    req.setTimeout(15000, () => {
-      req.destroy(new Error("Telegram request timeout"));
+    },res=>{
+      res.resume();
+      res.on("end",resolve);
     });
 
     req.write(body);
@@ -118,240 +78,176 @@ function sendTelegram(message: string): Promise<void> {
   });
 }
 
-function getStatValue(stats: Stat[], statType: string): number {
-  const stat = stats.find((s) => s.type === statType);
-  const value = stat?.value;
+function getStat(stats:Stat[],name:string){
+  const s = stats.find(x=>x.type===name);
+  const v = s?.value;
 
-  if (typeof value === "string") {
-    const parsed = parseInt(value.replace("%", ""), 10);
-    return Number.isNaN(parsed) ? 0 : parsed;
+  if(typeof v==="string"){
+    const p=parseInt(v.replace("%",""),10);
+    return Number.isNaN(p)?0:p;
   }
 
-  return value ?? 0;
+  return v ?? 0;
 }
 
-function buildPressureScore(params: {
-  minute: number;
-  totalShots: number;
-  totalOnTarget: number;
-  totalCorners: number;
-  dangerousAttacks: number;
-  possessionHome: number;
-  possessionAway: number;
-}): number {
-  const {
-    minute,
-    totalShots,
-    totalOnTarget,
-    totalCorners,
-    dangerousAttacks,
-    possessionHome,
-    possessionAway,
-  } = params;
+async function scan(){
 
-  let score = 0;
+  const headers = {"x-apisports-key":API_KEY};
 
-  // base
-  score += totalShots * 0.7;
-  score += totalOnTarget * 3.4;
-  score += totalCorners * 1.4;
-  score += dangerousAttacks * 0.17;
+  const live = await fetchJson(
+    "https://v3.football.api-sports.io/fixtures?live=all",
+    headers
+  );
 
-  // domination / contrôle
-  const possessionGap = Math.abs(possessionHome - possessionAway);
-  if (possessionGap >= 10) score += 1.0;
-  if (possessionGap >= 18) score += 1.0;
+  const fixtures = live.response ?? [];
 
-  // fenêtre chaude
-  if (minute >= 20 && minute <= 30) score += 2.0;
-  if (minute > 30 && minute <= 35) score += 1.0;
+  for(const match of fixtures){
 
-  // combos utiles
-  if (totalOnTarget >= 2 && totalCorners >= 3) score += 2.0;
-  if (totalOnTarget >= 3 && dangerousAttacks >= 25) score += 2.5;
-  if (totalCorners >= 5 && dangerousAttacks >= 30) score += 2.0;
-  if (totalShots >= 8 && totalOnTarget >= 3) score += 1.5;
+    const fixture = match.fixture;
+    const teams = match.teams;
+    const goals = match.goals;
 
-  return Number(score.toFixed(1));
-}
+    const minute = fixture.status.elapsed;
+    if(minute===null) continue;
 
-function getGoalProbabilityInfo(pressureScore: number): {
-  title: string;
-} {
-  if (pressureScore >= 20) {
-    return { title: "🔥 But imminent" };
-  }
+    const id = fixture.id;
 
-  if (pressureScore >= 12) {
-    return { title: "🌡️ But possible" };
-  }
+    const home = teams.home.name;
+    const away = teams.away.name;
 
-  return { title: "🧊 Match froid" };
-}
+    const homeGoals = goals.home ?? 0;
+    const awayGoals = goals.away ?? 0;
 
-async function sendForcedTestAlert() {
-  if (testAlertSent) return;
+    const isMain =
+      MAIN_TEAMS.has(home) || MAIN_TEAMS.has(away);
 
-  const message = [
-    "🧪 Test bot",
-    "Barcelona vs Marseille",
-    "24' • 0-0",
-    "🔥 But imminent",
-    "🎯 3 • 🚩 4 • ⚔️ 31",
-  ].join("\n");
+    const isSecondary =
+      SECONDARY_TEAMS.has(home) || SECONDARY_TEAMS.has(away);
 
-  await sendTelegram(message);
-  testAlertSent = true;
-}
+    if(!isMain && !isSecondary) continue;
 
-async function scan() {
-  try {
-    if (TEST_FORCE_ALERT) {
-      await sendForcedTestAlert();
-      return;
+    const statsData = await fetchJson(
+      `https://v3.football.api-sports.io/fixtures/statistics?fixture=${id}`,
+      headers
+    );
+
+    const statsHome = statsData.response?.[0]?.statistics ?? [];
+    const statsAway = statsData.response?.[1]?.statistics ?? [];
+
+    const shots =
+      getStat(statsHome,"Total Shots") +
+      getStat(statsAway,"Total Shots");
+
+    const onTarget =
+      getStat(statsHome,"Shots on Goal") +
+      getStat(statsAway,"Shots on Goal");
+
+    const corners =
+      getStat(statsHome,"Corner Kicks") +
+      getStat(statsAway,"Corner Kicks");
+
+    const dangerous =
+      getStat(statsHome,"Dangerous Attacks") +
+      getStat(statsAway,"Dangerous Attacks");
+
+    /* ---------------------------
+       1️⃣ NOTIF 15 MIN 0-0
+    --------------------------- */
+
+    if(
+      isMain &&
+      minute >=15 &&
+      homeGoals===0 &&
+      awayGoals===0 &&
+      !alerted15.has(id)
+    ){
+
+      await sendTelegram(
+        `🕒 15' 0-0\n${home} vs ${away}`
+      );
+
+      alerted15.add(id);
     }
 
-    const apiHeaders = { "x-apisports-key": API_KEY! };
+    /* ---------------------------
+       2️⃣ PRESSION 0-0
+    --------------------------- */
 
-    const liveData = (await fetchJson(
-      "https://v3.football.api-sports.io/fixtures?live=all",
-      apiHeaders
-    )) as { response?: Array<Record<string, unknown>> };
+    if(
+      minute>=15 &&
+      minute<=35 &&
+      homeGoals===0 &&
+      awayGoals===0 &&
+      !alertedPressure.has(id)
+    ){
 
-    const fixtures = liveData.response ?? [];
-    console.log(`[${new Date().toISOString()}] Live fixtures: ${fixtures.length}`);
+      if(
+        onTarget>=3 ||
+        corners>=5 ||
+        dangerous>=35
+      ){
 
-    for (const match of fixtures) {
-      const fixture = match["fixture"] as {
-        id: number;
-        status: { elapsed: number | null };
-      };
+        const level =
+          onTarget>=4 || dangerous>=40
+          ? "🔥 But imminent"
+          : "🌡️ But possible";
 
-      const teams = match["teams"] as {
-        home: { name: string };
-        away: { name: string };
-      };
+        await sendTelegram(
+`${level}
+${home} vs ${away}
+${minute}' • 0-0
+🎯 ${onTarget} • 🚩 ${corners} • ⚔️ ${dangerous}`
+        );
 
-      const goals = match["goals"] as {
-        home: number | null;
-        away: number | null;
-      };
-
-      const fixtureId = fixture.id;
-      const minute = fixture.status.elapsed;
-      const home = teams.home.name;
-      const away = teams.away.name;
-      const scoreHome = goals.home ?? 0;
-      const scoreAway = goals.away ?? 0;
-
-      const isFavoriteMatch =
-        FAVORITE_TEAMS.has(home) || FAVORITE_TEAMS.has(away);
-
-      if (!WATCH_ALL_MATCHES && !isFavoriteMatch) continue;
-      if (minute === null) continue;
-      if (scoreHome !== 0 || scoreAway !== 0) continue;
-
-      // NOTIF 1 : 15 MIN - on la garde absolument
-      if (minute >= 15 && !alertedFixtures15.has(fixtureId)) {
-        const message15 = [
-          "🕒 15' 0-0",
-          `${home} vs ${away}`,
-        ].join("\n");
-
-        await sendTelegram(message15);
-        alertedFixtures15.add(fixtureId);
+        alertedPressure.add(id);
       }
-
-      // NOTIF 2 : VERSION PRO
-      if (minute < 15 || minute > 35) continue;
-      if (alertedFixturesPressure.has(fixtureId)) continue;
-
-      const statsData = (await fetchJson(
-        `https://v3.football.api-sports.io/fixtures/statistics?fixture=${fixtureId}`,
-        apiHeaders
-      )) as {
-        response?: Array<{
-          statistics: Stat[];
-        }>;
-      };
-
-      const statsResponse = statsData.response ?? [];
-      if (statsResponse.length < 2) continue;
-
-      const statsHome = statsResponse[0]!.statistics;
-      const statsAway = statsResponse[1]!.statistics;
-
-      const shotsHome = getStatValue(statsHome, "Total Shots");
-      const shotsAway = getStatValue(statsAway, "Total Shots");
-      const onTargetHome = getStatValue(statsHome, "Shots on Goal");
-      const onTargetAway = getStatValue(statsAway, "Shots on Goal");
-      const cornersHome = getStatValue(statsHome, "Corner Kicks");
-      const cornersAway = getStatValue(statsAway, "Corner Kicks");
-      const dangerousHome = getStatValue(statsHome, "Dangerous Attacks");
-      const dangerousAway = getStatValue(statsAway, "Dangerous Attacks");
-      const possessionHome = getStatValue(statsHome, "Ball Possession");
-      const possessionAway = getStatValue(statsAway, "Ball Possession");
-
-      const totalShots = shotsHome + shotsAway;
-      const totalOnTarget = onTargetHome + onTargetAway;
-      const totalCorners = cornersHome + cornersAway;
-      const totalDangerousAttacks = dangerousHome + dangerousAway;
-
-      // filtre anti-déchets
-      const enoughActivity =
-        totalShots >= 4 ||
-        totalOnTarget >= 2 ||
-        totalCorners >= 3 ||
-        totalDangerousAttacks >= 20;
-
-      const notTooDead = totalShots >= 3;
-      const notTooWild = totalShots <= 16;
-
-      if (!enoughActivity || !notTooDead || !notTooWild) continue;
-
-      const pressureScore = buildPressureScore({
-        minute,
-        totalShots,
-        totalOnTarget,
-        totalCorners,
-        dangerousAttacks: totalDangerousAttacks,
-        possessionHome,
-        possessionAway,
-      });
-
-      const shouldAlert =
-        pressureScore >= 12 ||
-        totalOnTarget >= 3 ||
-        totalCorners >= 5 ||
-        totalDangerousAttacks >= 35 ||
-        (totalOnTarget >= 2 && totalCorners >= 4);
-
-      if (!shouldAlert) continue;
-
-      const goalProb = getGoalProbabilityInfo(pressureScore);
-
-      const messagePressure = [
-        goalProb.title,
-        `${home} vs ${away}`,
-        `${minute}' • 0-0`,
-        `🎯 ${totalOnTarget} • 🚩 ${totalCorners} • ⚔️ ${totalDangerousAttacks}`,
-      ].join("\n");
-
-      await sendTelegram(messagePressure);
-      alertedFixturesPressure.add(fixtureId);
     }
-  } catch (e) {
-    console.error("Scan error:", (e as Error).message);
+
+    /* ---------------------------
+       3️⃣ OVER 1.5
+    --------------------------- */
+
+    if(
+      minute>=20 &&
+      minute<=70 &&
+      !alertedOver.has(id)
+    ){
+
+      const totalGoals = homeGoals + awayGoals;
+
+      if(totalGoals===1){
+
+        if(
+          onTarget>=4 ||
+          corners>=5 ||
+          dangerous>=40
+        ){
+
+          await sendTelegram(
+`⚡ Over 1.5 probable
+${home} vs ${away}
+${minute}' • ${homeGoals}-${awayGoals}
+🎯 ${onTarget} • 🚩 ${corners} • ⚔️ ${dangerous}`
+          );
+
+          alertedOver.add(id);
+        }
+      }
+    }
+
   }
 }
 
-async function main() {
-  console.log("Football alert bot started.");
+async function main(){
 
-  while (true) {
+  console.log("Bot started");
+
+  while(true){
+
     await scan();
-    console.log("Scan done — waiting 60s...");
-    await new Promise((r) => setTimeout(r, 60_000));
+
+    await new Promise(r=>setTimeout(r,60000));
+
   }
 }
 
