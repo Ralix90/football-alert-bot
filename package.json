@@ -1,0 +1,11 @@
+{
+  "name": "football-alert-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "tsx": "^4.7.0"
+  },
+  "scripts": {
+    "start": "tsx football-alert.ts"
+  }
+}
