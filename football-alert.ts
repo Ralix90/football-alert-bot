@@ -10,17 +10,35 @@ if (!TELEGRAM_TOKEN || !CHAT_ID || !API_KEY) {
   process.exit(1);
 }
 
-// true = envoie une alerte test au démarrage
-const TEST_FORCE_ALERT = false;
+// =========================
+// RÉGLAGES GÉNÉRAUX
+// =========================
 
-// true = surveille tous les matchs
+const TEST_FORCE_ALERT = false;
 const WATCH_ALL_MATCHES = false;
 
 // Anti-spam global
 const PRO_ALERT_WINDOW_MS = 10 * 60 * 1000; // 10 min
 const MAX_PRO_ALERTS_PER_WINDOW = 3;
 
-// Equipes principales : notif 15' + notif premium
+// Cache stats
+const STATS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
+
+// Cache planning du jour
+const TODAY_FIXTURES_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
+
+// Rythme de scan
+const SLEEP_NO_TRACKED_TODAY_MS = 60 * 60 * 1000; // 60 min
+const SLEEP_FAR_FROM_KICKOFF_MS = 30 * 60 * 1000; // 30 min
+const SLEEP_CLOSE_TO_KICKOFF_MS = 10 * 60 * 1000; // 10 min
+const SLEEP_TRACKED_LIVE_IDLE_MS = 10 * 60 * 1000; // 10 min
+const SLEEP_TRACKED_LIVE_HOT_MS = 5 * 60 * 1000; // 5 min
+
+// =========================
+// ÉQUIPES
+// =========================
+
+// Équipes principales : notif 15' + notif premium
 const MAIN_TEAMS = new Set([
   "Barcelona",
   "Real Madrid",
@@ -33,7 +51,7 @@ const MAIN_TEAMS = new Set([
   "Marseille",
 ]);
 
-// Equipes secondaires : seulement notif premium
+// Équipes secondaires : notif premium seulement
 const SECONDARY_TEAMS = new Set([
   "Liverpool",
   "Chelsea",
@@ -62,13 +80,15 @@ const SECONDARY_TEAMS = new Set([
   "Rangers",
 ]);
 
+// =========================
+// ÉTAT
+// =========================
+
 const alerted15 = new Set<number>();
 const alertedPressure = new Set<number>();
 const alertedOver = new Set<number>();
 
 const proAlertTimestamps: number[] = [];
-
-let testAlertSent = false;
 
 type Stat = {
   type: string;
@@ -86,7 +106,44 @@ type MatchSnapshot = {
   updatedAt: number;
 };
 
+type StatsBundle = {
+  totalShots: number;
+  totalOnTarget: number;
+  totalCorners: number;
+  totalDangerousAttacks: number;
+  possessionHome: number;
+  possessionAway: number;
+};
+
+type CachedStats = {
+  fetchedAt: number;
+  data: StatsBundle;
+};
+
+type TrackedFixture = {
+  id: number;
+  home: string;
+  away: string;
+  date: string;
+  isMain: boolean;
+  isSecondary: boolean;
+};
+
+type TodayFixturesCache = {
+  fetchedAt: number;
+  dateKey: string;
+  trackedFixtures: TrackedFixture[];
+};
+
 const lastSnapshots = new Map<number, MatchSnapshot>();
+const statsCache = new Map<number, CachedStats>();
+
+let todayFixturesCache: TodayFixturesCache | null = null;
+let testAlertSent = false;
+
+// =========================
+// OUTILS HTTP
+// =========================
 
 function fetchJson(url: string, headers: Record<string, string>): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -159,6 +216,10 @@ function sendTelegram(message: string): Promise<void> {
   });
 }
 
+// =========================
+// OUTILS MÉTIER
+// =========================
+
 function getStat(stats: Stat[], name: string): number {
   const s = stats.find((x) => x.type === name);
   const v = s?.value;
@@ -173,6 +234,106 @@ function getStat(stats: Stat[], name: string): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function canSendProAlert(): boolean {
+  const now = Date.now();
+
+  while (
+    proAlertTimestamps.length > 0 &&
+    now - proAlertTimestamps[0]! > PRO_ALERT_WINDOW_MS
+  ) {
+    proAlertTimestamps.shift();
+  }
+
+  return proAlertTimestamps.length < MAX_PRO_ALERTS_PER_WINDOW;
+}
+
+function markProAlertSent(): void {
+  proAlertTimestamps.push(Date.now());
+}
+
+function pruneCaches(): void {
+  const now = Date.now();
+
+  for (const [fixtureId, snapshot] of lastSnapshots.entries()) {
+    if (now - snapshot.updatedAt > 3 * 60 * 60 * 1000) {
+      lastSnapshots.delete(fixtureId);
+    }
+  }
+
+  for (const [fixtureId, cached] of statsCache.entries()) {
+    if (now - cached.fetchedAt > 2 * 60 * 60 * 1000) {
+      statsCache.delete(fixtureId);
+    }
+  }
+}
+
+function getEuropeParisDateKey(): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Paris",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const year = parts.find((p) => p.type === "year")?.value ?? "0000";
+  const month = parts.find((p) => p.type === "month")?.value ?? "00";
+  const day = parts.find((p) => p.type === "day")?.value ?? "00";
+
+  return `${year}-${month}-${day}`;
+}
+
+function isTrackedTeams(home: string, away: string): {
+  isTracked: boolean;
+  isMain: boolean;
+  isSecondary: boolean;
+} {
+  if (WATCH_ALL_MATCHES) {
+    return {
+      isTracked: true,
+      isMain: true,
+      isSecondary: false,
+    };
+  }
+
+  const isMain = MAIN_TEAMS.has(home) || MAIN_TEAMS.has(away);
+  const isSecondary =
+    SECONDARY_TEAMS.has(home) || SECONDARY_TEAMS.has(away);
+
+  return {
+    isTracked: isMain || isSecondary,
+    isMain,
+    isSecondary,
+  };
+}
+
+function computeMomentum(current: MatchSnapshot, previous?: MatchSnapshot): number {
+  if (!previous) return 0;
+
+  const minuteDiff = Math.max(1, current.minute - previous.minute);
+
+  const deltaShots = current.totalShots - previous.totalShots;
+  const deltaOnTarget = current.totalOnTarget - previous.totalOnTarget;
+  const deltaCorners = current.totalCorners - previous.totalCorners;
+  const deltaDangerous =
+    current.totalDangerousAttacks - previous.totalDangerousAttacks;
+
+  let score = 0;
+  score += deltaShots * 0.5;
+  score += deltaOnTarget * 2.2;
+  score += deltaCorners * 1.0;
+  score += deltaDangerous * 0.12;
+
+  if (minuteDiff <= 2) score += 0.8;
+
+  return Number(Math.max(0, score).toFixed(1));
+}
+
+function getMomentumLabel(momentumScore: number): string {
+  if (momentumScore >= 3.5) return "🚀 fort";
+  if (momentumScore >= 2) return "📈 bon";
+  return "➖ neutre";
 }
 
 function buildPressureScore(params: {
@@ -210,7 +371,7 @@ function buildPressureScore(params: {
 
   if (minute >= 20 && minute <= 30) score += 2.0;
   if (minute > 30 && minute <= 35) score += 1.0;
-  if (minute >= 45 && minute <= 65) score += 1.0; // utile pour over 1.5
+  if (minute >= 45 && minute <= 65) score += 1.0;
 
   if (totalOnTarget >= 2 && totalCorners >= 3) score += 2.0;
   if (totalOnTarget >= 3 && dangerousAttacks >= 25) score += 2.5;
@@ -218,35 +379,6 @@ function buildPressureScore(params: {
   if (totalShots >= 8 && totalOnTarget >= 3) score += 1.5;
 
   return Number(score.toFixed(1));
-}
-
-function getMomentumLabel(momentumScore: number): string {
-  if (momentumScore >= 3.5) return "🚀 fort";
-  if (momentumScore >= 2) return "📈 bon";
-  return "➖ neutre";
-}
-
-function computeMomentum(current: MatchSnapshot, previous?: MatchSnapshot): number {
-  if (!previous) return 0;
-
-  const minuteDiff = Math.max(1, current.minute - previous.minute);
-
-  const deltaShots = current.totalShots - previous.totalShots;
-  const deltaOnTarget = current.totalOnTarget - previous.totalOnTarget;
-  const deltaCorners = current.totalCorners - previous.totalCorners;
-  const deltaDangerous =
-    current.totalDangerousAttacks - previous.totalDangerousAttacks;
-
-  let score = 0;
-  score += deltaShots * 0.5;
-  score += deltaOnTarget * 2.2;
-  score += deltaCorners * 1.0;
-  score += deltaDangerous * 0.12;
-
-  // si tout ça arrive vite, on bonifie
-  if (minuteDiff <= 2) score += 0.8;
-
-  return Number(Math.max(0, score).toFixed(1));
 }
 
 function getGoalProbabilityPercent(params: {
@@ -320,27 +452,117 @@ function getPressureTitle(pressureScore: number, probability: number): string {
   return "🧊 Match froid";
 }
 
-function canSendProAlert(): boolean {
-  const now = Date.now();
+function isActionableWindow(
+  minute: number,
+  homeGoals: number,
+  awayGoals: number
+): boolean {
+  const totalGoals = homeGoals + awayGoals;
 
-  while (proAlertTimestamps.length > 0 && now - proAlertTimestamps[0]! > PRO_ALERT_WINDOW_MS) {
-    proAlertTimestamps.shift();
+  if (homeGoals === 0 && awayGoals === 0 && minute >= 15 && minute <= 35) {
+    return true;
   }
 
-  return proAlertTimestamps.length < MAX_PRO_ALERTS_PER_WINDOW;
-}
-
-function markProAlertSent(): void {
-  proAlertTimestamps.push(Date.now());
-}
-
-function pruneSnapshots(): void {
-  const now = Date.now();
-  for (const [fixtureId, snapshot] of lastSnapshots.entries()) {
-    if (now - snapshot.updatedAt > 3 * 60 * 60 * 1000) {
-      lastSnapshots.delete(fixtureId);
-    }
+  if (totalGoals === 1 && minute >= 20 && minute <= 70) {
+    return true;
   }
+
+  return false;
+}
+
+async function getStatsForFixture(
+  fixtureId: number,
+  headers: Record<string, string>
+): Promise<StatsBundle> {
+  const cached = statsCache.get(fixtureId);
+  const now = Date.now();
+
+  if (cached && now - cached.fetchedAt < STATS_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const statsData = await fetchJson(
+    `https://v3.football.api-sports.io/fixtures/statistics?fixture=${fixtureId}`,
+    headers
+  );
+
+  const statsHome = statsData.response?.[0]?.statistics ?? [];
+  const statsAway = statsData.response?.[1]?.statistics ?? [];
+
+  const data: StatsBundle = {
+    totalShots:
+      getStat(statsHome, "Total Shots") + getStat(statsAway, "Total Shots"),
+    totalOnTarget:
+      getStat(statsHome, "Shots on Goal") + getStat(statsAway, "Shots on Goal"),
+    totalCorners:
+      getStat(statsHome, "Corner Kicks") + getStat(statsAway, "Corner Kicks"),
+    totalDangerousAttacks:
+      getStat(statsHome, "Dangerous Attacks") +
+      getStat(statsAway, "Dangerous Attacks"),
+    possessionHome: getStat(statsHome, "Ball Possession"),
+    possessionAway: getStat(statsAway, "Ball Possession"),
+  };
+
+  statsCache.set(fixtureId, {
+    fetchedAt: now,
+    data,
+  });
+
+  return data;
+}
+
+async function getTrackedFixturesToday(
+  headers: Record<string, string>
+): Promise<TrackedFixture[]> {
+  const todayKey = getEuropeParisDateKey();
+  const now = Date.now();
+
+  if (
+    todayFixturesCache &&
+    todayFixturesCache.dateKey === todayKey &&
+    now - todayFixturesCache.fetchedAt < TODAY_FIXTURES_CACHE_TTL_MS
+  ) {
+    return todayFixturesCache.trackedFixtures;
+  }
+
+  const url = `https://v3.football.api-sports.io/fixtures?date=${todayKey}&timezone=Europe/Paris`;
+  const response = await fetchJson(url, headers);
+
+  const fixtures = response.response ?? [];
+
+  const trackedFixtures: TrackedFixture[] = fixtures
+    .map((item: any) => {
+      const home = item?.teams?.home?.name ?? "";
+      const away = item?.teams?.away?.name ?? "";
+
+      const tracked = isTrackedTeams(home, away);
+
+      if (!tracked.isTracked) return null;
+
+      return {
+        id: item?.fixture?.id,
+        home,
+        away,
+        date: item?.fixture?.date,
+        isMain: tracked.isMain,
+        isSecondary: tracked.isSecondary,
+      } satisfies TrackedFixture;
+    })
+    .filter(Boolean);
+
+  todayFixturesCache = {
+    fetchedAt: now,
+    dateKey: todayKey,
+    trackedFixtures,
+  };
+
+  console.log(`Tracked fixtures today: ${trackedFixtures.length}`);
+
+  return trackedFixtures;
+}
+
+function getMsUntil(dateIso: string): number {
+  return new Date(dateIso).getTime() - Date.now();
 }
 
 async function sendForcedTestAlert() {
@@ -358,26 +580,69 @@ async function sendForcedTestAlert() {
   testAlertSent = true;
 }
 
-async function scan() {
+// =========================
+// SCAN PRINCIPAL
+// =========================
+
+async function scan(): Promise<number> {
   try {
     if (TEST_FORCE_ALERT) {
       await sendForcedTestAlert();
-      return;
+      return SLEEP_CLOSE_TO_KICKOFF_MS;
     }
 
-    pruneSnapshots();
+    pruneCaches();
 
     const headers = { "x-apisports-key": API_KEY };
 
+    // 1) On regarde d'abord seulement si tes équipes jouent aujourd'hui
+    const trackedFixturesToday = await getTrackedFixturesToday(headers);
+
+    if (trackedFixturesToday.length === 0) {
+      console.log("No tracked fixtures today.");
+      return SLEEP_NO_TRACKED_TODAY_MS;
+    }
+
+    // Cherche le prochain coup d'envoi de tes équipes aujourd'hui
+    const futureTracked = trackedFixturesToday
+      .map((f) => ({
+        ...f,
+        msUntil: getMsUntil(f.date),
+      }))
+      .filter((f) => f.msUntil > 0)
+      .sort((a, b) => a.msUntil - b.msUntil);
+
+    if (futureTracked.length > 0 && futureTracked[0]!.msUntil > 45 * 60 * 1000) {
+      console.log("Tracked fixtures exist today, but next kickoff is not soon.");
+      return SLEEP_FAR_FROM_KICKOFF_MS;
+    }
+
+    // 2) Seulement là, on demande le live global
     const live = await fetchJson(
       "https://v3.football.api-sports.io/fixtures?live=all",
       headers
     );
 
-    const fixtures = live.response ?? [];
-    console.log(`[${new Date().toISOString()}] Live fixtures: ${fixtures.length}`);
+    const liveFixtures = live.response ?? [];
+    console.log(`Live fixtures found: ${liveFixtures.length}`);
 
-    for (const match of fixtures) {
+    // On garde seulement les matchs live qui correspondent à tes équipes
+    const trackedLive = liveFixtures.filter((match: any) => {
+      const home = match?.teams?.home?.name ?? "";
+      const away = match?.teams?.away?.name ?? "";
+      return isTrackedTeams(home, away).isTracked;
+    });
+
+    console.log(`Tracked live fixtures: ${trackedLive.length}`);
+
+    if (trackedLive.length === 0) {
+      // Il y a des matchs de tes équipes aujourd'hui, mais pas live maintenant
+      return SLEEP_CLOSE_TO_KICKOFF_MS;
+    }
+
+    let hasHotWindow = false;
+
+    for (const match of trackedLive) {
       const fixture = match.fixture;
       const teams = match.teams;
       const goals = match.goals;
@@ -393,77 +658,11 @@ async function scan() {
       const awayGoals = goals.away ?? 0;
       const totalGoals = homeGoals + awayGoals;
 
-      const isMain = MAIN_TEAMS.has(home) || MAIN_TEAMS.has(away);
-      const isSecondary = SECONDARY_TEAMS.has(home) || SECONDARY_TEAMS.has(away);
+      const tracked = isTrackedTeams(home, away);
+      const isMain = tracked.isMain;
+      const isSecondary = tracked.isSecondary;
 
-      if (!WATCH_ALL_MATCHES && !isMain && !isSecondary) continue;
-
-      const statsData = await fetchJson(
-        `https://v3.football.api-sports.io/fixtures/statistics?fixture=${id}`,
-        headers
-      );
-
-      const statsHome = statsData.response?.[0]?.statistics ?? [];
-      const statsAway = statsData.response?.[1]?.statistics ?? [];
-
-      const totalShots =
-        getStat(statsHome, "Total Shots") + getStat(statsAway, "Total Shots");
-      const totalOnTarget =
-        getStat(statsHome, "Shots on Goal") + getStat(statsAway, "Shots on Goal");
-      const totalCorners =
-        getStat(statsHome, "Corner Kicks") + getStat(statsAway, "Corner Kicks");
-      const totalDangerousAttacks =
-        getStat(statsHome, "Dangerous Attacks") +
-        getStat(statsAway, "Dangerous Attacks");
-      const possessionHome = getStat(statsHome, "Ball Possession");
-      const possessionAway = getStat(statsAway, "Ball Possession");
-
-      const currentSnapshot: MatchSnapshot = {
-        minute,
-        totalShots,
-        totalOnTarget,
-        totalCorners,
-        totalDangerousAttacks,
-        scoreHome: homeGoals,
-        scoreAway: awayGoals,
-        updatedAt: Date.now(),
-      };
-
-      const previousSnapshot = lastSnapshots.get(id);
-      const momentumScore = computeMomentum(currentSnapshot, previousSnapshot);
-      lastSnapshots.set(id, currentSnapshot);
-
-      const pressureScore = buildPressureScore({
-        minute,
-        totalShots,
-        totalOnTarget,
-        totalCorners,
-        dangerousAttacks: totalDangerousAttacks,
-        possessionHome,
-        possessionAway,
-        momentumScore,
-      });
-
-      const probability = getGoalProbabilityPercent({
-        pressureScore,
-        totalOnTarget,
-        totalCorners,
-        totalDangerousAttacks,
-        minute,
-        totalGoals,
-      });
-
-      const matchQuality = getQualityOutOf10({
-        pressureScore,
-        totalOnTarget,
-        totalCorners,
-        totalDangerousAttacks,
-        momentumScore,
-      });
-
-      const momentumLabel = getMomentumLabel(momentumScore);
-
-      // 1) NOTIF 15 MIN 0-0 uniquement pour les principales
+      // 15' 0-0 pour principales
       if (
         isMain &&
         minute >= 15 &&
@@ -475,7 +674,65 @@ async function scan() {
         alerted15.add(id);
       }
 
-      // 2) NOTIF PRESSION / BUT PROBABLE sur 0-0
+      // Si pas dans une fenêtre utile, on ne demande pas les stats
+      if (!isActionableWindow(minute, homeGoals, awayGoals)) {
+        continue;
+      }
+
+      hasHotWindow = true;
+
+      console.log(
+        `Fetching stats for: ${home} vs ${away} | ${minute}' | ${homeGoals}-${awayGoals}`
+      );
+
+      const stats = await getStatsForFixture(id, headers);
+
+      const currentSnapshot: MatchSnapshot = {
+        minute,
+        totalShots: stats.totalShots,
+        totalOnTarget: stats.totalOnTarget,
+        totalCorners: stats.totalCorners,
+        totalDangerousAttacks: stats.totalDangerousAttacks,
+        scoreHome: homeGoals,
+        scoreAway: awayGoals,
+        updatedAt: Date.now(),
+      };
+
+      const previousSnapshot = lastSnapshots.get(id);
+      const momentumScore = computeMomentum(currentSnapshot, previousSnapshot);
+      lastSnapshots.set(id, currentSnapshot);
+
+      const pressureScore = buildPressureScore({
+        minute,
+        totalShots: stats.totalShots,
+        totalOnTarget: stats.totalOnTarget,
+        totalCorners: stats.totalCorners,
+        dangerousAttacks: stats.totalDangerousAttacks,
+        possessionHome: stats.possessionHome,
+        possessionAway: stats.possessionAway,
+        momentumScore,
+      });
+
+      const probability = getGoalProbabilityPercent({
+        pressureScore,
+        totalOnTarget: stats.totalOnTarget,
+        totalCorners: stats.totalCorners,
+        totalDangerousAttacks: stats.totalDangerousAttacks,
+        minute,
+        totalGoals,
+      });
+
+      const matchQuality = getQualityOutOf10({
+        pressureScore,
+        totalOnTarget: stats.totalOnTarget,
+        totalCorners: stats.totalCorners,
+        totalDangerousAttacks: stats.totalDangerousAttacks,
+        momentumScore,
+      });
+
+      const momentumLabel = getMomentumLabel(momentumScore);
+
+      // 2) PRESSION / BUT PROBABLE sur 0-0
       if (
         minute >= 15 &&
         minute <= 35 &&
@@ -484,29 +741,29 @@ async function scan() {
         !alertedPressure.has(id)
       ) {
         const enoughActivity =
-          totalShots >= 4 ||
-          totalOnTarget >= 2 ||
-          totalCorners >= 3 ||
-          totalDangerousAttacks >= 20;
+          stats.totalShots >= 4 ||
+          stats.totalOnTarget >= 2 ||
+          stats.totalCorners >= 3 ||
+          stats.totalDangerousAttacks >= 20;
 
-        const notTooDead = totalShots >= 3;
-        const notTooWild = totalShots <= 16;
+        const notTooDead = stats.totalShots >= 3;
+        const notTooWild = stats.totalShots <= 16;
 
         if (enoughActivity && notTooDead && notTooWild && canSendProAlert()) {
           const shouldAlertMain =
             pressureScore >= 12 ||
-            totalOnTarget >= 3 ||
-            totalCorners >= 5 ||
-            totalDangerousAttacks >= 35 ||
-            (totalOnTarget >= 2 && totalCorners >= 4) ||
+            stats.totalOnTarget >= 3 ||
+            stats.totalCorners >= 5 ||
+            stats.totalDangerousAttacks >= 35 ||
+            (stats.totalOnTarget >= 2 && stats.totalCorners >= 4) ||
             probability >= 58 ||
             momentumScore >= 2.5;
 
           const shouldAlertSecondary =
             pressureScore >= 15 ||
-            totalOnTarget >= 4 ||
-            totalCorners >= 6 ||
-            totalDangerousAttacks >= 40 ||
+            stats.totalOnTarget >= 4 ||
+            stats.totalCorners >= 6 ||
+            stats.totalDangerousAttacks >= 40 ||
             probability >= 66 ||
             momentumScore >= 3;
 
@@ -519,7 +776,7 @@ async function scan() {
               `${title} • ${probability}%`,
               `${home} vs ${away}`,
               `${minute}' • 0-0`,
-              `🎯 ${totalOnTarget} • 🚩 ${totalCorners} • ⚔️ ${totalDangerousAttacks} • ${momentumLabel} • ⭐ ${matchQuality}/10`,
+              `🎯 ${stats.totalOnTarget} • 🚩 ${stats.totalCorners} • ⚔️ ${stats.totalDangerousAttacks} • ${momentumLabel} • ⭐ ${matchQuality}/10`,
             ].join("\n");
 
             await sendTelegram(message);
@@ -529,7 +786,7 @@ async function scan() {
         }
       }
 
-      // 3) NOTIF OVER 1.5 sur 1-0 / 0-1 entre 20 et 70
+      // 3) OVER 1.5 sur 1-0 / 0-1 entre 20 et 70
       if (
         minute >= 20 &&
         minute <= 70 &&
@@ -537,9 +794,9 @@ async function scan() {
         !alertedOver.has(id)
       ) {
         const enoughForOver =
-          totalOnTarget >= 4 ||
-          totalCorners >= 5 ||
-          totalDangerousAttacks >= 40 ||
+          stats.totalOnTarget >= 4 ||
+          stats.totalCorners >= 5 ||
+          stats.totalDangerousAttacks >= 40 ||
           pressureScore >= 15 ||
           probability >= 64 ||
           momentumScore >= 2.8;
@@ -554,7 +811,7 @@ async function scan() {
             `${overTitle} • ${probability}%`,
             `${home} vs ${away}`,
             `${minute}' • ${homeGoals}-${awayGoals}`,
-            `🎯 ${totalOnTarget} • 🚩 ${totalCorners} • ⚔️ ${totalDangerousAttacks} • ${momentumLabel} • ⭐ ${matchQuality}/10`,
+            `🎯 ${stats.totalOnTarget} • 🚩 ${stats.totalCorners} • ⚔️ ${stats.totalDangerousAttacks} • ${momentumLabel} • ⭐ ${matchQuality}/10`,
           ].join("\n");
 
           await sendTelegram(message);
@@ -563,17 +820,29 @@ async function scan() {
         }
       }
     }
+
+    if (hasHotWindow) {
+      return SLEEP_TRACKED_LIVE_HOT_MS;
+    }
+
+    return SLEEP_TRACKED_LIVE_IDLE_MS;
   } catch (e) {
     console.error("Scan error:", (e as Error).message);
+    return SLEEP_CLOSE_TO_KICKOFF_MS;
   }
 }
+
+// =========================
+// MAIN
+// =========================
 
 async function main() {
   console.log("Bot started");
 
   while (true) {
-    await scan();
-    await new Promise((r) => setTimeout(r, 60000));
+    const nextSleep = await scan();
+    console.log(`Next scan in ${Math.round(nextSleep / 60000)} min`);
+    await new Promise((r) => setTimeout(r, nextSleep));
   }
 }
 
