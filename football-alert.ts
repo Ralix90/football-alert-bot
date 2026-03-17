@@ -1,9 +1,5 @@
 import https from "node:https";
 
-// =========================
-// ENV
-// =========================
-
 const TELEGRAM_TOKEN = process.env["TELEGRAM_TOKEN"];
 const CHAT_ID = process.env["TELEGRAM_CHAT_ID"];
 const API_KEY = process.env["API_FOOTBALL_KEY"];
@@ -72,15 +68,23 @@ const alertedOver = new Set<number>();
 
 function fetchJson(url: string): Promise<any> {
   return new Promise((resolve, reject) => {
-    https.get(
-      url,
-      { headers: { "x-apisports-key": API_KEY } },
-      (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => resolve(JSON.parse(data)));
-      }
-    ).on("error", reject);
+    https
+      .get(
+        url,
+        { headers: { "x-apisports-key": API_KEY } },
+        (res) => {
+          let data = "";
+          res.on("data", (c) => (data += c));
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              reject(e);
+            }
+          });
+        }
+      )
+      .on("error", reject);
   });
 }
 
@@ -97,7 +101,7 @@ function sendTelegram(message: string) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Content-Length": body.length,
+        "Content-Length": Buffer.byteLength(body),
       },
     },
     () => {}
@@ -121,7 +125,7 @@ function isTracked(home: string, away: string) {
 }
 
 // =========================
-// MATCH DU JOUR
+// MATCHS DU JOUR
 // =========================
 
 async function getMatchesToday() {
@@ -131,11 +135,12 @@ async function getMatchesToday() {
     `https://v3.football.api-sports.io/fixtures?date=${today}`
   );
 
-  return data.response
+  return (data.response ?? [])
     .map((m: any) => {
-      const home = m.teams.home.name;
-      const away = m.teams.away.name;
+      const home = m?.teams?.home?.name;
+      const away = m?.teams?.away?.name;
 
+      if (!home || !away) return null;
       if (!isTracked(home, away)) return null;
 
       return {
@@ -149,14 +154,14 @@ async function getMatchesToday() {
 }
 
 // =========================
-// SCAN ULTRA ECO
+// SCAN ULTRA ÉCO
 // =========================
 
 async function scan(): Promise<number> {
   try {
     const now = Date.now();
 
-    // ⏱️ Attente planifiée
+    // Attente planifiée
     if (nextCheckTimestamp && now < nextCheckTimestamp) {
       return nextCheckTimestamp - now;
     }
@@ -164,16 +169,17 @@ async function scan(): Promise<number> {
     const matches = await getMatchesToday();
 
     if (!matches.length) {
-      console.log("Aucun match aujourd'hui");
-      return 6 * 60 * 60 * 1000;
+      console.log("Aucun match suivi aujourd'hui");
+      return 6 * 60 * 60 * 1000; // 6h
     }
 
     const future = matches
-      .map((m) => ({ ...m, ms: getMsUntil(m.date) }))
-      .filter((m) => m.ms > 0)
-      .sort((a, b) => a.ms - b.ms);
+      .map((m: any) => ({ ...m, ms: getMsUntil(m.date) }))
+      .filter((m: any) => m.ms > 0)
+      .sort((a: any, b: any) => a.ms - b.ms);
 
     if (!future.length) {
+      console.log("Tous les matchs du jour sont passés");
       return 6 * 60 * 60 * 1000;
     }
 
@@ -211,34 +217,40 @@ async function scan(): Promise<number> {
       "https://v3.football.api-sports.io/fixtures?live=all"
     );
 
-    for (const m of live.response) {
-      const home = m.teams.home.name;
-      const away = m.teams.away.name;
+    const liveMatches = live.response ?? [];
 
+    for (const m of liveMatches) {
+      const home = m?.teams?.home?.name;
+      const away = m?.teams?.away?.name;
+
+      if (!home || !away) continue;
       if (!isTracked(home, away)) continue;
 
       const id = m.fixture.id;
-      const minute = m.fixture.status.elapsed;
+      const minute = m.fixture?.status?.elapsed;
       const goals = m.goals;
 
       if (!minute) continue;
 
-      // 🕒 15 min 0-0
+      const homeGoals = goals?.home ?? 0;
+      const awayGoals = goals?.away ?? 0;
+
+      // 🕒 15 min 0-0 pour MAIN + SECONDARY
       if (
         minute >= 15 &&
-        goals.home === 0 &&
-        goals.away === 0 &&
+        homeGoals === 0 &&
+        awayGoals === 0 &&
         !alerted15.has(id)
       ) {
         sendTelegram(`🕒 15' 0-0\n${home} vs ${away}`);
         alerted15.add(id);
       }
 
-      // ⚡ Over 1.5
+      // ⚡ Over 1.5 probable
       if (
         minute >= 20 &&
         minute <= 70 &&
-        goals.home + goals.away === 1 &&
+        homeGoals + awayGoals === 1 &&
         !alertedOver.has(id)
       ) {
         sendTelegram(
@@ -248,7 +260,7 @@ async function scan(): Promise<number> {
       }
     }
 
-    return 5 * 60 * 1000;
+    return 5 * 60 * 1000; // 5 min pendant live
   } catch (e) {
     console.log("Erreur:", e);
     return 15 * 60 * 1000;
