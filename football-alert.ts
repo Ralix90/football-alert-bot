@@ -115,13 +115,26 @@ function getMsUntil(date: string) {
   return new Date(date).getTime() - Date.now();
 }
 
+function normalizeTeamName(name: string) {
+  return name
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/-/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function isTracked(home: string, away: string) {
-  return (
-    MAIN_TEAMS.has(home) ||
-    MAIN_TEAMS.has(away) ||
-    SECONDARY_TEAMS.has(home) ||
-    SECONDARY_TEAMS.has(away)
-  );
+  const homeNorm = normalizeTeamName(home);
+  const awayNorm = normalizeTeamName(away);
+
+  const allTeams = [
+    ...Array.from(MAIN_TEAMS),
+    ...Array.from(SECONDARY_TEAMS),
+  ].map(normalizeTeamName);
+
+  return allTeams.includes(homeNorm) || allTeams.includes(awayNorm);
 }
 
 // =========================
@@ -129,16 +142,25 @@ function isTracked(home: string, away: string) {
 // =========================
 
 async function getMatchesToday() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Paris",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 
   const data = await fetchJson(
-    `https://v3.football.api-sports.io/fixtures?date=${today}`
+    `https://v3.football.api-sports.io/fixtures?date=${today}&timezone=Europe/Paris`
   );
+
+  console.log("Date demandée à l'API :", today);
 
   return (data.response ?? [])
     .map((m: any) => {
       const home = m?.teams?.home?.name;
       const away = m?.teams?.away?.name;
+
+      console.log("Match API :", home, "vs", away);
 
       if (!home || !away) return null;
       if (!isTracked(home, away)) return null;
@@ -161,7 +183,6 @@ async function scan(): Promise<number> {
   try {
     const now = Date.now();
 
-    // Attente planifiée
     if (nextCheckTimestamp && now < nextCheckTimestamp) {
       return nextCheckTimestamp - now;
     }
@@ -170,7 +191,7 @@ async function scan(): Promise<number> {
 
     if (!matches.length) {
       console.log("Aucun match suivi aujourd'hui");
-      return 6 * 60 * 60 * 1000; // 6h
+      return 6 * 60 * 60 * 1000;
     }
 
     const future = matches
@@ -260,7 +281,7 @@ async function scan(): Promise<number> {
       }
     }
 
-    return 5 * 60 * 1000; // 5 min pendant live
+    return 5 * 60 * 1000;
   } catch (e) {
     console.log("Erreur:", e);
     return 15 * 60 * 1000;
